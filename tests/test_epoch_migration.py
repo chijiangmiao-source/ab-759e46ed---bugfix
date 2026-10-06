@@ -229,5 +229,147 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(after["migration"]["phase"], "published")
 
 
+    # ---------------------------------------------------- 重复正文：逐条保留
+
+    def test_duplicate_content_records_preserved_across_migration(self):
+        """两条正文完全相同的观测是独立记录：跨批复制、校验、发布后逐条保留。"""
+        ws = self.store.create_workspace("重复正文")
+        page = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page, "雨后土壤湿度偏高")
+        self.store.add_record(ws["id"], page, "雨后土壤湿度偏高")
+        self.store.add_record(ws["id"], page, "风速 3 级")
+        before = self.store.get_state(ws["id"])["records"]
+        self.assertEqual([r["seq"] for r in before], [1, 2, 3])
+
+        # batch_size=1 强制三条记录跨三个复制批次，检验跨批复制不再按正文归并
+        self.store.start_migration(ws["id"], page, "v2")
+        phases = []
+        while True:
+            s = self.store.copy_batch(ws["id"], page, 1)
+            phases.append(s["migration"]["phase"])
+            if s["migration"]["phase"] == "validating":
+                break
+        self.assertIn("copying", phases)
+        s = self.store.validate_migration(ws["id"], page)
+        self.assertEqual(s["migration"]["phase"], "publishing")  # 校验通过
+        s = self.store.publish_migration(ws["id"], page)
+        self.assertEqual(s["migration"]["phase"], "published")
+
+        after = s["records"]
+        self.assertEqual(len(after), 3)                                   # 记录数未减少
+        self.assertEqual([r["seq"] for r in after], [1, 2, 3])            # 序号完整有序
+        self.assertEqual([r["content"] for r in after],
+                         ["雨后土壤湿度偏高", "雨后土壤湿度偏高", "风速 3 级"])
+        self.assertEqual([r["created_at"] for r in after],
+                         [r["created_at"] for r in before])               # 创建时间一致
+        # 关闭后重开页面：新纪元仍是完整三条
+        self.store.close_page(ws["id"], page)
+        fresh = self.store.open_page(ws["id"])
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(fresh["epoch_number"], 2)
+        self.assertEqual(len(s["records"]), 3)
+
+    def test_case_and_whitespace_variants_are_distinct_records(self):
+        """大小写或空白形式相近但不同的观测不能被视为同一条。"""
+        ws = self.store.create_workspace("相近正文")
+        page = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page, "Alpha")
+        self.store.add_record(ws["id"], page, "alpha")
+        # 含首尾空白的历史记录（写入 API 会规整，这里直接落库代表既有差异形态）
+        epoch = self.store.get_state(ws["id"])["current_epoch"]["id"]
+        self.store.conn.execute(
+            "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            ("rec_ws_variant", ws["id"], epoch, 3, "  Alpha\t",
+             "2026-01-01T00:00:00+00:00"))
+        self.drive_to(ws["id"], page, "published")
+        contents = [r["content"] for r in self.store.get_state(ws["id"])["records"]]
+        self.assertEqual(contents, ["Alpha", "alpha", "  Alpha\t"])
+
+    def test_duplicate_content_validation_catches_real_loss(self):
+        """候选确实丢记录时校验必须失败，不能靠内容归并蒙混通过。"""
+        ws = self.store.create_workspace("严格校验")
+        page = self.store.open_page(ws["id"])["page_id"]
+        for content in ("a", "a", "b"):
+            self.store.add_record(ws["id"], page, content)
+        self.store.start_migration(ws["id"], page, "v2")
+        while self.store.copy_batch(ws["id"], page, 1)["migration"]["phase"] == "copying":
+            pass
+        cand = self.store.get_state(ws["id"])["migration"]["candidate_epoch"]["id"]
+        self.store.conn.execute(
+            "DELETE FROM records WHERE epoch_id=? AND seq=2", (cand,))
+        s = self.store.validate_migration(ws["id"], page)
+        self.assertEqual(s["migration"]["phase"], "failed")
+
+    # -------------------------------------------- 已发布受损工作区的安全收敛
+
+    def _seed_legacy_damaged_published(self):
+        """构造「旧版错误归并代码」发布后的受损现场：当前纪元 #2 缺少一条重复正文。"""
+        from app.db import new_id
+        ws = self.store.create_workspace("历史受损")
+        page = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page, "雨后湿度")
+        self.store.add_record(ws["id"], page, "雨后湿度")
+        self.store.add_record(ws["id"], page, "风速3级")
+        ep1 = self.store.get_state(ws["id"])["current_epoch"]["id"]
+        t1, _, t3 = [r["created_at"] for r in self.store.conn.execute(
+            "SELECT created_at FROM records WHERE epoch_id=? ORDER BY seq", (ep1,))]
+        ep2 = new_id("ep")
+        published_at = "2026-05-01T00:00:00.000+00:00"
+        self.store.conn.execute(
+            "INSERT INTO epochs(id,workspace_id,number,version,kind,created_at,converged_at) "
+            "VALUES(?,?,?,?,'published',?,NULL)",
+            (ep2, ws["id"], 2, "v2", published_at))
+        self.store.conn.execute(
+            "UPDATE epochs SET kind='superseded', converged_at=NULL WHERE id=?", (ep1,))
+        for seq, content, ts in ((1, "雨后湿度", t1), (3, "风速3级", t3)):
+            self.store.conn.execute(
+                "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (new_id("rec"), ws["id"], ep2, seq, content, ts))
+        new_ts = "2026-06-01T00:00:00.000+00:00"
+        new_rec = new_id("rec")
+        self.store.conn.execute(
+            "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (new_rec, ws["id"], ep2, 4, "迁移后新增", new_ts))
+        self.store.conn.execute(
+            "UPDATE workspaces SET current_epoch_id=?, migration_phase='published' WHERE id=?",
+            (ep2, ws["id"]))
+        return ws["id"], (new_rec, new_ts)
+
+    def test_damaged_published_epoch_converges_on_reopen(self):
+        ws_id, (new_rec, new_ts) = self._seed_legacy_damaged_published()
+        self.store.close()
+        self.store = Store(self.db_path)  # 重开触发收敛
+        s = self.store.get_state(ws_id)
+        self.assertEqual(s["current_epoch"]["number"], 2)      # 不回退当前纪元
+        self.assertEqual(s["current_epoch"]["version"], "v2")
+        self.assertEqual([(r["seq"], r["content"]) for r in s["records"]],
+                         [(1, "雨后湿度"), (2, "雨后湿度"), (3, "风速3级"),
+                          (4, "迁移后新增")])
+        row = self.store.conn.execute(
+            "SELECT seq, created_at FROM records WHERE id=?", (new_rec,)).fetchone()
+        self.assertEqual((row["seq"], row["created_at"]), (4, new_ts))  # 新增记录未被覆盖
+
+    def test_convergence_idempotent_and_preserves_write_fencing(self):
+        ws_id, _ = self._seed_legacy_damaged_published()
+        self.store.close()
+        self.store = Store(self.db_path)
+        first = [(r["seq"], r["content"], r["created_at"])
+                 for r in self.store.get_state(ws_id)["records"]]
+        self.store.close()
+        self.store = Store(self.db_path)  # 再次重开：幂等
+        second = [(r["seq"], r["content"], r["created_at"])
+                  for r in self.store.get_state(ws_id)["records"]]
+        self.assertEqual(first, second)
+        # 收敛后新页面可正常写入，旧页面不会重新获得写资格
+        page = self.store.open_page(ws_id)["page_id"]
+        self.store.add_record(ws_id, page, "收敛后再写")
+        s = self.store.get_state(ws_id)
+        self.assertEqual(len(s["records"]), 5)
+        self.assertEqual(s["records"][-1]["content"], "收敛后再写")
+
+
 if __name__ == "__main__":
     unittest.main()

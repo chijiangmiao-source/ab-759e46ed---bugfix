@@ -4,7 +4,8 @@
 步骤穿插执行：构建检查 -> 代码测试 -> 健康/页面 HTTP 冒烟 -> API 冒烟 ->
 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建第二候选）->
 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）->
-场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）。
+场景三（重复正文跨批复制、校验、发布与重开恢复，逐条核对数量/顺序/序号/时间）->
+场景四（发布后进程重启，本地恢复的纪元/记录/失效状态一致，含重复正文工作区）。
 
 用法：
   python verify.py [--base-url http://app:8000] [--no-restart]
@@ -262,9 +263,70 @@ def scenario_interruption_recovery(ctx):
     check(len(s["records"]) == 6, "新纪元记录应完整")
 
 
-# ---------------------------------------------------------------- 场景三
+# ---------------------------------------------------------------- 场景三（重复正文）
 
-@step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
+@step("场景三：重复正文跨批复制、校验、发布与重开恢复逐条完整")
+def scenario_duplicate_content(ctx):
+    ws_name = f"verify-dup-{uuid.uuid4().hex[:8]}"
+    ws = req(ctx, "POST", "/api/workspaces", {"name": ws_name}, expect=201)[1]["id"]
+    page_a = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+    page_b = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+
+    # 三条记录：两条正文完全相同（可能落在同一毫秒），另一条不同
+    contents = ["雨后土壤湿度偏高", "雨后土壤湿度偏高", "风速 3 级"]
+    for c in contents:
+        req(ctx, "POST", f"/api/workspaces/{ws}/records",
+            {"page_id": page_a, "content": c}, expect=201)
+    _, before = req(ctx, "GET", f"/api/workspaces/{ws}/state", expect=200)
+    check(len(before["records"]) == 3, f"迁移前应有 3 条: {len(before['records'])}")
+    check([r["seq"] for r in before["records"]] == [1, 2, 3], "迁移前序号应为 1/2/3")
+
+    # 发起迁移，batch_size=1 强制逐条跨批复制
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/start",
+        {"page_id": page_a, "target_version": "v2"}, expect=200)
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page_a, "batch_size": 1}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    # 校验：候选与源必须逐条一致（含重复正文）才通过
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/validate",
+               {"page_id": page_a}, expect=200)
+    check(s["migration"]["phase"] == "publishing",
+          f"重复正文逐条一致时校验应通过: {s['migration']['phase']} {s['migration'].get('error')}")
+    # 发布前复核 + 原子发布
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/publish",
+               {"page_id": page_a}, expect=200)
+    check(s["migration"]["phase"] == "published", "迁移应已发布")
+    check(s["current_epoch"]["number"] == 2 and s["current_epoch"]["record_count"] == 3,
+          f"新纪元记录数应为 3: {s['current_epoch']}")
+    check([(r["seq"], r["content"], r["created_at"]) for r in s["records"]] ==
+          [(r["seq"], r["content"], r["created_at"]) for r in before["records"]],
+          "新纪元记录的数量、顺序、序号、正文、时间须与迁移前逐条一致")
+
+    # 发布后旧页面迟到保存仍被拒绝（回归围栏）
+    code, err = req(ctx, "POST", f"/api/workspaces/{ws}/records",
+                    {"page_id": page_b, "content": "迟到记录"})
+    check(code == 409 and "重新载入" in err.get("message", ""),
+          f"发布后旧写应被拒绝: {code} {err}")
+
+    # 关闭旧页面后重新打开：读取仍是完整三条，且可在新纪元继续写入
+    req(ctx, "POST", f"/api/workspaces/{ws}/pages/{page_a}/close", expect=200)
+    page_c = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+    req(ctx, "POST", f"/api/workspaces/{ws}/records",
+        {"page_id": page_c, "content": "新纪元追加"}, expect=201)
+    _, s = req(ctx, "GET", f"/api/workspaces/{ws}/state", expect=200)
+    check(s["current_epoch"]["number"] == 2, "重开后不应回退纪元")
+    check([r["content"] for r in s["records"]] ==
+          ["雨后土壤湿度偏高", "雨后土壤湿度偏高", "风速 3 级", "新纪元追加"],
+          "重开恢复后记录应完整且保留追加顺序")
+    check([r["seq"] for r in s["records"]] == [1, 2, 3, 4], "重开后序号应连续")
+    ctx["dup_ws"] = ws
+
+
+# ---------------------------------------------------------------- 场景三（重启）
+
+@step("场景四：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
 def scenario_restart_consistency(ctx):
     if ctx["no_restart"]:
         print("[verify] 跳过（--no-restart）")
@@ -290,6 +352,16 @@ def scenario_restart_consistency(ctx):
     inv_after = {p["id"] for p in after["pages"] if p["state"] == "invalidated"}
     check(inv_before and inv_before <= inv_after, "失效页面状态不一致")
 
+    # 重复正文工作区在进程重启后同样逐条完整（数量、顺序、序号）
+    dup = ctx.get("dup_ws")
+    if dup:
+        _, d = req(ctx, "GET", f"/api/workspaces/{dup}/state", expect=200)
+        check(d["current_epoch"]["number"] == 2, "重复正文工作区纪元不应回退")
+        check([(r["seq"], r["content"]) for r in d["records"]] ==
+              [(1, "雨后土壤湿度偏高"), (2, "雨后土壤湿度偏高"),
+               (3, "风速 3 级"), (4, "新纪元追加")],
+              "重启后重复正文记录应逐条完整有序")
+
 
 # ---------------------------------------------------------------- 主流程
 
@@ -304,7 +376,7 @@ def main():
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
              scenario_stale_write_rejected, scenario_interruption_recovery,
-             scenario_restart_consistency]
+             scenario_duplicate_content, scenario_restart_consistency]
     for s in steps:
         s(ctx)
 

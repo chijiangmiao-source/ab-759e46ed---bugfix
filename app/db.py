@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS epochs (
   version TEXT NOT NULL,
   kind TEXT NOT NULL,              -- published | candidate | superseded
   created_at TEXT NOT NULL,
+  -- 逐条记录收敛标记：已确认记录与上游纪元逐条一致（含正文重复的观测）
+  converged_at TEXT,
   UNIQUE (workspace_id, number)
 );
 CREATE TABLE IF NOT EXISTS records (
@@ -62,15 +64,17 @@ CREATE TABLE IF NOT EXISTS records (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(epoch_id, seq);
-CREATE TABLE IF NOT EXISTS migration_copy_keys (
+-- 迁移复制进度：去重单位是「源记录 id」而不是正文。
+-- 正文相同、大小写或空白相近的观测是独立记录，必须逐条复制。
+CREATE TABLE IF NOT EXISTS migration_copied_records (
   candidate_epoch_id TEXT NOT NULL,
-  content_key TEXT NOT NULL,
+  source_record_id TEXT NOT NULL,
   source_seq INTEGER NOT NULL,
   created_at TEXT NOT NULL,
-  PRIMARY KEY (candidate_epoch_id, content_key)
+  PRIMARY KEY (candidate_epoch_id, source_record_id)
 );
-CREATE INDEX IF NOT EXISTS idx_migration_copy_keys_candidate
-  ON migration_copy_keys(candidate_epoch_id, source_seq);
+CREATE INDEX IF NOT EXISTS idx_migration_copied_candidate
+  ON migration_copied_records(candidate_epoch_id, source_seq);
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -118,8 +122,15 @@ class Store:
         self.conn.execute("PRAGMA busy_timeout=5000")
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate_schema_locked()
         # 进程重启 = 所有页面连接已断开：关闭遗留活动页面并恢复未完成的迁移
         self.recover_all()
+
+    def _migrate_schema_locked(self):
+        """为旧版数据库补齐新增列（SQLite 无 IF NOT EXISTS 的 ADD COLUMN）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(epochs)")}
+        if "converged_at" not in cols:
+            self.conn.execute("ALTER TABLE epochs ADD COLUMN converged_at TEXT")
 
     def close(self):
         with self._lock:
@@ -156,18 +167,19 @@ class Store:
         return self.conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
 
     def _checksum(self, epoch_id: str) -> tuple[int, str]:
-        """纪元的 (记录数, 内容摘要)，用于复制后校验与发布前复核。"""
+        """纪元的 (记录数, 逐条内容摘要)，用于复制后校验与发布前复核。
+
+        每条记录按 (seq, 原始正文, 创建时间) 独立计入：正文相同、大小写或空白
+        相近的观测是不同记录，绝不归并。校验、发布前复核与发布后读取因此对同一份
+        逐条记录集合达成一致。
+        """
         rows = self.conn.execute(
-            "SELECT MIN(seq) AS seq, LOWER(TRIM(content)) AS content "
-            "FROM records WHERE epoch_id=? "
-            "GROUP BY LOWER(TRIM(content)) ORDER BY seq",
+            "SELECT seq, content, created_at FROM records WHERE epoch_id=? ORDER BY seq",
             (epoch_id,),
         ).fetchall()
         h = hashlib.sha256()
         for r in rows:
-            h.update(f"{r['seq']}|".encode())
-            h.update(r["content"].encode())
-            h.update(b"\n")
+            h.update(f"{r['seq']}|{r['content']}|{r['created_at']}\n".encode("utf-8"))
         return (len(rows), h.hexdigest())
 
     def _require_driver(self, ws: sqlite3.Row, page: sqlite3.Row | None):
@@ -196,6 +208,11 @@ class Store:
                 owner = self._page(ws["migration_owner_page_id"])
                 if owner is None or owner["state"] != "active":
                     self._recover_locked(ws)
+            else:
+                # 没有进行中迁移：让已发布纪元安全收敛，补齐旧版错误归并掉的重复正文记录
+                cur = self._epoch(ws["current_epoch_id"])
+                if cur is not None and cur["converged_at"] is None:
+                    self._converge_chain_locked(cur)
 
     def _recover_locked(self, ws: sqlite3.Row):
         """依据持久化阶段恢复：复制中->回收候选；校验中->续用同一候选；发布中->完成发布。"""
@@ -206,7 +223,7 @@ class Store:
             # 复制可能只完成了一部分：安全回收候选，绝不展示部分复制的数据
             if cand:
                 self.conn.execute(
-                    "DELETE FROM migration_copy_keys WHERE candidate_epoch_id=?", (cand,))
+                    "DELETE FROM migration_copied_records WHERE candidate_epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM records WHERE epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM epochs WHERE id=?", (cand,))
             self.conn.execute(
@@ -226,6 +243,98 @@ class Store:
             # 发布事务未提交即中断：候选已校验，恢复时把发布补齐（幂等）
             self._publish_locked(ws)
 
+    def _converge_chain_locked(self, current: sqlite3.Row):
+        """让当前纪元及其未收敛的历代纪元安全收敛为完整的逐条记录集合。
+
+        仅在没有进行中迁移时调用。沿纪元编号向上找到最近一个已收敛纪元，再自上而下
+        逐个补齐：不切换工作区指针、不回退当前纪元、不触碰迁移后新增记录的内容与时间。
+        """
+        chain = []
+        epoch = current
+        guard = 0
+        while epoch is not None and guard < 1_000_000:
+            guard += 1
+            chain.append(epoch)
+            if epoch["converged_at"] is not None:
+                break
+            epoch = self.conn.execute(
+                "SELECT * FROM epochs WHERE workspace_id=? AND number=?",
+                (current["workspace_id"], epoch["number"] - 1),
+            ).fetchone()
+        for epoch in reversed(chain):
+            if epoch["converged_at"] is None:
+                self._converge_epoch_locked(epoch)
+
+    def _converge_epoch_locked(self, epoch: sqlite3.Row):
+        """补齐单个纪元相对上一纪元缺失的逐条记录（含正文重复/相近的观测）。
+
+        复制保留了源记录的序号、正文与创建时间，迁移后新增记录则三者都不与源记录
+        重合。据此把现存记录归位到其源序号，归不进源的即迁移后新增记录：先临时让出
+        序号区，按源序号补回缺失的原始记录，再把新增记录按原顺序接排（内容、时间不变）。
+        """
+        now = utcnow()
+        prev = self.conn.execute(
+            "SELECT * FROM epochs WHERE workspace_id=? AND number=?",
+            (epoch["workspace_id"], epoch["number"] - 1),
+        ).fetchone()
+        if prev is not None:
+            src_rows = self.conn.execute(
+                "SELECT seq, content, created_at FROM records "
+                "WHERE epoch_id=? ORDER BY seq",
+                (prev["id"],),
+            ).fetchall()
+            cur_rows = self.conn.execute(
+                "SELECT id, seq, content, created_at FROM records "
+                "WHERE epoch_id=? ORDER BY seq, created_at",
+                (epoch["id"],),
+            ).fetchall()
+            # 复制保留了源记录的序号、正文与创建时间；迁移后新增记录三者都不与源重合。
+            # 先按 (序号, 正文, 时间) 精确归位（重复正文、同一毫秒时间戳也能区分），
+            # 再按 (正文, 时间) 兜底归位，仍归不进源的即迁移后新增记录。
+            src_by_seq = {r["seq"]: r for r in src_rows}
+            src_by_key: dict[tuple[str, str], list[int]] = {}
+            for r in src_rows:
+                src_by_key.setdefault((r["content"], r["created_at"]), []).append(r["seq"])
+            consumed: set[int] = set()
+            appended = []
+            tentative = []
+            for r in cur_rows:
+                src = src_by_seq.get(r["seq"])
+                if (src is not None and r["seq"] not in consumed
+                        and src["content"] == r["content"]
+                        and src["created_at"] == r["created_at"]):
+                    consumed.add(r["seq"])          # 复制而来，精确占住源序号
+                else:
+                    tentative.append(r)
+            for r in tentative:
+                seqs = src_by_key.get((r["content"], r["created_at"]))
+                slot = next((q for q in (seqs or []) if q not in consumed), None)
+                if slot is not None:
+                    consumed.add(slot)
+                else:
+                    appended.append(r)              # 迁移后新增
+            missing = [r for r in src_rows if r["seq"] not in consumed]
+            if missing:
+                # 新增记录临时让出序号区，按源序号补回缺失记录，新增记录再按原顺序接排
+                SHIFT = 1_000_000_000
+                for i, r in enumerate(appended, start=1):
+                    self.conn.execute(
+                        "UPDATE records SET seq=? WHERE id=?", (SHIFT + i, r["id"]))
+                for r in missing:
+                    self.conn.execute(
+                        "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (new_id("rec"), epoch["workspace_id"], epoch["id"],
+                         r["seq"], r["content"], r["created_at"]),
+                    )
+                for i, r in enumerate(appended, start=1):
+                    self.conn.execute(
+                        "UPDATE records SET seq=? WHERE id=?",
+                        (len(src_rows) + i, r["id"]),
+                    )
+        self.conn.execute(
+            "UPDATE epochs SET converged_at=? WHERE id=?", (now, epoch["id"]))
+
     def recover_all(self):
         """进程启动时调用：上一生命周期的页面全部视为已关闭，并恢复所有迁移。"""
         with self._lock:
@@ -239,6 +348,15 @@ class Store:
                 ).fetchall()
                 for ws in rows:
                     self._recover_locked(ws)
+                # 无进行中迁移的工作区：已发布纪元安全收敛，补齐旧版归并掉的重复正文记录
+                rows = self.conn.execute(
+                    "SELECT w.* FROM workspaces w JOIN epochs e ON e.id = w.current_epoch_id "
+                    "WHERE w.migration_phase NOT IN ('copying','validating','publishing') "
+                    "AND e.converged_at IS NULL"
+                ).fetchall()
+                for ws in rows:
+                    self._converge_chain_locked(
+                        self._epoch(ws["current_epoch_id"]))
 
     # ---------------------------------------------------------------- 工作区
 
@@ -262,9 +380,9 @@ class Store:
                 except sqlite3.IntegrityError:
                     raise ApiError(409, "name_taken", "同名工作区已存在")
                 self.conn.execute(
-                    "INSERT INTO epochs(id,workspace_id,number,version,kind,created_at) "
-                    "VALUES(?,?,?,?,'published',?)",
-                    (epoch_id, ws_id, 1, "v1", now),
+                    "INSERT INTO epochs(id,workspace_id,number,version,kind,created_at,converged_at) "
+                    "VALUES(?,?,?,?,'published',?,?)",
+                    (epoch_id, ws_id, 1, "v1", now, now),
                 )
         return self.get_state(ws_id)
 
@@ -389,7 +507,8 @@ class Store:
                 old_cand = ws["migration_candidate_epoch_id"]
                 if old_cand:
                     self.conn.execute(
-                        "DELETE FROM migration_copy_keys WHERE candidate_epoch_id=?", (old_cand,))
+                        "DELETE FROM migration_copied_records WHERE candidate_epoch_id=?",
+                        (old_cand,))
                     self.conn.execute("DELETE FROM records WHERE epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM epochs WHERE id=?", (old_cand,))
                 number = self.conn.execute(
@@ -441,18 +560,19 @@ class Store:
                 cand = ws["migration_candidate_epoch_id"]
                 copied = ws["migration_copied"]
                 rows = self.conn.execute(
-                    "SELECT seq, content, created_at FROM records "
+                    "SELECT id, seq, content, created_at FROM records "
                     "WHERE epoch_id=? ORDER BY seq LIMIT ? OFFSET ?",
                     (src, batch_size, copied),
                 ).fetchall()
+                now = utcnow()
                 for r in rows:
-                    content_key = hashlib.sha256(
-                        r["content"].strip().casefold().encode("utf-8")
-                    ).hexdigest()
+                    # 去重单位是源记录 id（逐条复制），不是正文：正文相同/大小写或
+                    # 空白相近的观测各自独立，跨批复制也不会相互覆盖或被跳过。
                     claim = self.conn.execute(
-                        "INSERT OR IGNORE INTO migration_copy_keys("
-                        "candidate_epoch_id,content_key,source_seq,created_at) VALUES(?,?,?,?)",
-                        (cand, content_key, r["seq"], utcnow()),
+                        "INSERT OR IGNORE INTO migration_copied_records("
+                        "candidate_epoch_id,source_record_id,source_seq,created_at) "
+                        "VALUES(?,?,?,?)",
+                        (cand, r["id"], r["seq"], now),
                     )
                     if claim.rowcount:
                         self.conn.execute(
@@ -534,6 +654,12 @@ class Store:
             return False
         self.conn.execute("UPDATE epochs SET kind='superseded' WHERE id=?", (old,))
         self.conn.execute("UPDATE epochs SET kind='published' WHERE id=?", (cand,))
+        # 通过逐条校验的候选与源纪元完全一致：源已收敛则候选同样完整，直接标记收敛，
+        # 避免之后重复补齐；源未收敛时两者都留给收敛链处理。
+        old_row = self._epoch(old)
+        if old_row is not None and old_row["converged_at"] is not None:
+            self.conn.execute(
+                "UPDATE epochs SET converged_at=? WHERE id=?", (now, cand))
         # 持有旧纪元围栏的页面全部失效：其后的迟到保存会被拒绝
         self.conn.execute(
             "UPDATE pages SET state='invalidated', invalidated_at=? "
