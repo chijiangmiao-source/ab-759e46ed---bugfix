@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.db import ApiError, Store  # noqa: E402
+from app.db import ApiError, Store, new_id, utcnow  # noqa: E402
 
 
 class StoreTestCase(unittest.TestCase):
@@ -227,6 +227,175 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(states[page_a], "invalidated")
         self.assertEqual(states[page_b], "invalidated")
         self.assertEqual(after["migration"]["phase"], "published")
+
+    # ---------------------------------------------------- 重复正文逐条保留
+
+    def test_identical_content_records_all_survive_cross_batch_migration(self):
+        """两条正文完全相同的观测是独立记录：跨批复制、校验、发布、重开全部保留。"""
+        ws, page_a = self.make_ws()
+        wid = ws["id"]
+        self.store.add_record(wid, page_a, "降雨 10mm")
+        self.store.add_record(wid, page_a, "降雨 10mm")  # 与上一条正文完全相同
+        self.store.add_record(wid, page_a, "晴天")
+        before = self.store.get_state(wid)["records"]
+        original_times = [r["created_at"] for r in before]
+        self.assertEqual([r["seq"] for r in before], [1, 2, 3])
+
+        # 故意每批只复制 1 条，让相同正文跨批次出现
+        self.store.start_migration(wid, page_a, "v2")
+        phases = []
+        for _ in range(5):
+            s = self.store.copy_batch(wid, page_a, 1)
+            phases.append(s["migration"]["phase"])
+            if s["migration"]["phase"] == "validating":
+                break
+        self.assertIn("validating", phases)
+        s = self.store.validate_migration(wid, page_a)
+        self.assertEqual(s["migration"]["phase"], "publishing")  # 校验必须通过
+        s = self.store.publish_migration(wid, page_a)
+        self.assertEqual(s["migration"]["phase"], "published")
+
+        after = s["records"]
+        self.assertEqual(len(after), 3, f"记录数减少: {after}")
+        self.assertEqual([r["seq"] for r in after], [1, 2, 3])
+        self.assertEqual([r["content"] for r in after],
+                         ["降雨 10mm", "降雨 10mm", "晴天"])
+        # 各自的创建时间完整保留（独立记录，不合并）
+        self.assertEqual([r["created_at"] for r in after], original_times)
+        self.assertEqual(after[0]["id"] != after[1]["id"], True)
+
+        # 关闭后重新打开页面：仍是完整三条，顺序不变
+        self.store.close_page(wid, page_a)
+        page_b = self.store.open_page(wid)["page_id"]
+        s = self.store.get_state(wid)
+        self.assertEqual(s["current_epoch"]["number"], 2)
+        self.assertEqual([(r["seq"], r["content"]) for r in s["records"]],
+                         [(1, "降雨 10mm"), (2, "降雨 10mm"), (3, "晴天")])
+
+    def test_case_and_whitespace_similar_records_are_distinct(self):
+        """大小写/空白形式相近也不能被折叠为同一条观测。"""
+        ws, page_a = self.make_ws()
+        wid = ws["id"]
+        contents = ["RAIN", "rain", "rain  fall", "rain fall"]
+        for c in contents:
+            self.store.add_record(wid, page_a, c)
+        self.drive_to(wid, page_a, "published", batch=1)
+        s = self.store.get_state(wid)
+        self.assertEqual(len(s["records"]), 4)
+        self.assertEqual([r["content"] for r in s["records"]], contents)
+        self.assertEqual([r["seq"] for r in s["records"]], [1, 2, 3, 4])
+
+        # 即使绕过录入直接放入首尾带空白的记录，复制/校验也不得做 TRIM 归一化
+        page_b = self.store.open_page(wid)["page_id"]
+        ws2 = self.store.create_workspace("空白样地")
+        w2 = ws2["id"]
+        p2 = self.store.open_page(w2)["page_id"]
+        ep = ws2["current_epoch"]["id"]
+        now = utcnow()
+        with self.store._tx():
+            self.store.conn.execute(
+                "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                "VALUES(?,?,?,?,?,?)", (new_id("rec"), w2, ep, 1, "x", now))
+            self.store.conn.execute(
+                "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                "VALUES(?,?,?,?,?,?)", (new_id("rec"), w2, ep, 2, "  x  ", now))
+        self.drive_to(w2, p2, "published", batch=1)
+        got = self.store.get_state(w2)["records"]
+        self.assertEqual([r["content"] for r in got], ["x", "  x  "])
+
+    def _make_legacy_dedup_published(self):
+        """复刻旧缺陷已发布的工作区：候选按归一化正文去重，吞掉重复正文记录。"""
+        ws = self.store.create_workspace("旧缺陷站")
+        wid = ws["id"]
+        old_page = self.store.open_page(wid)["page_id"]
+        self.store.add_record(wid, old_page, "降雨")
+        self.store.add_record(wid, old_page, "降雨")  # 将被旧逻辑吞掉
+        self.store.add_record(wid, old_page, "晴天")
+        ep1 = ws["current_epoch"]["id"]
+        src = self.store.conn.execute(
+            "SELECT seq,content,created_at FROM records WHERE epoch_id=? ORDER BY seq",
+            (ep1,)).fetchall()
+        with self.store._tx():
+            ep2 = new_id("ep")
+            now = utcnow()
+            self.store.conn.execute(
+                "INSERT INTO epochs(id,workspace_id,number,version,kind,created_at) "
+                "VALUES(?,?,?,?,'candidate',?)", (ep2, wid, 2, "v2", now))
+            for r in src:
+                if r["seq"] != 2:  # 旧 bug：第二条“降雨”被去重
+                    self.store.conn.execute(
+                        "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (new_id("rec"), wid, ep2, r["seq"], r["content"], r["created_at"]))
+            self.store.conn.execute(
+                "UPDATE epochs SET kind='superseded' WHERE id=?", (ep1,))
+            self.store.conn.execute(
+                "UPDATE epochs SET kind='published' WHERE id=?", (ep2,))
+            self.store.conn.execute(
+                "UPDATE pages SET state='invalidated', invalidated_at=? "
+                "WHERE workspace_id=? AND epoch_id=?", (now, wid, ep1))
+            self.store.conn.execute(
+                "UPDATE workspaces SET current_epoch_id=?, migration_phase='published', "
+                "migration_target_version='v2', migration_candidate_epoch_id=NULL, "
+                "migration_source_epoch_id=?, migration_owner_page_id=NULL, "
+                "migration_started_at=?, migration_updated_at=? WHERE id=?",
+                (ep2, ep1, now, now, wid))
+        return wid, old_page, ep1, [dict(r) for r in src]
+
+    def test_legacy_affected_workspace_heals_safely_on_reopen(self):
+        """已被旧缺陷发布掉记录的工作区，重开存储时安全收敛为完整记录。"""
+        wid, old_page, ep1, src = self._make_legacy_dedup_published()
+        # 旧进程在受影响纪元上又新增一条（绝不能被覆盖）
+        new_page = self.store.open_page(wid)["page_id"]
+        self.store.add_record(wid, new_page, "迁移后新增")
+        self.store.close()
+
+        self.store = Store(self.db_path, page_ttl_seconds=45)
+        s = self.store.get_state(wid)
+        # 当前纪元不回退，仍是 #2/v2
+        self.assertEqual(s["current_epoch"]["number"], 2)
+        self.assertEqual(s["current_epoch"]["version"], "v2")
+        self.assertEqual(s["migration"]["phase"], "published")
+        # 记录按原顺序完整：补回的 seq=2 排在新增 seq=4 之前
+        self.assertEqual([(r["seq"], r["content"]) for r in s["records"]],
+                         [(1, "降雨"), (2, "降雨"), (3, "晴天"), (4, "迁移后新增")])
+        restored = next(r for r in s["records"] if r["seq"] == 2)
+        self.assertEqual(restored["created_at"], src[1]["created_at"])  # 沿用原时间
+        # 旧页面保持失效，不会重新获得写入资格
+        self.assert_api_error(409, "page_not_active",
+                              self.store.add_record, wid, old_page, "旧页偷写")
+        # 新页面写入序号顺延
+        page = self.store.open_page(wid)["page_id"]
+        r = self.store.add_record(wid, page, "再补一条")
+        self.assertEqual(r["seq"], 5)
+
+        # 再次重启：收敛幂等，不重复补、不丢新增
+        self.store.close()
+        self.store = Store(self.db_path, page_ttl_seconds=45)
+        s = self.store.get_state(wid)
+        self.assertEqual([r["seq"] for r in s["records"]], [1, 2, 3, 4, 5])
+
+    def test_legacy_affected_workspace_heals_on_page_reopen_without_restart(self):
+        """不重启进程，关闭后重新打开页面也应触发安全收敛。"""
+        wid, old_page, ep1, src = self._make_legacy_dedup_published()
+        # 构造后尚未经过任何维护入口：直接读底层表确认受影响状态确实缺记录
+        cur_ep = self.store.conn.execute(
+            "SELECT current_epoch_id FROM workspaces WHERE id=?", (wid,)).fetchone()[0]
+        seqs = [r[0] for r in self.store.conn.execute(
+            "SELECT seq FROM records WHERE epoch_id=? ORDER BY seq", (cur_ep,)).fetchall()]
+        self.assertEqual(seqs, [1, 3], "构造的受影响状态应先缺记录")
+
+        # 重新打开页面即触发惰性安全收敛
+        page = self.store.open_page(wid)["page_id"]
+        s = self.store.get_state(wid)
+        self.assertEqual(s["current_epoch"]["number"], 2)
+        self.assertEqual([r["content"] for r in s["records"]],
+                         ["降雨", "降雨", "晴天"])
+        states = {p["id"]: p["state"] for p in s["pages"]}
+        self.assertEqual(states[old_page], "invalidated")
+        # 收敛后仍可正常写入
+        r = self.store.add_record(wid, page, "后续观测")
+        self.assertEqual(r["seq"], 4)
 
 
 if __name__ == "__main__":

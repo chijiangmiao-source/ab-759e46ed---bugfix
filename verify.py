@@ -2,6 +2,7 @@
 """verify 服务：在编排环境内完成全部验收并自行退出，以退出码报告结果。
 
 步骤穿插执行：构建检查 -> 代码测试 -> 健康/页面 HTTP 冒烟 -> API 冒烟 ->
+重复正文场景（两条正文相同+一条不同，跨批复制/校验/发布/重开均逐条保留）->
 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建第二候选）->
 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）->
 场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）。
@@ -151,6 +152,64 @@ def smoke_api(ctx):
     code, s = req(ctx, "GET", f"/api/workspaces/{ws['id']}/state", expect=200)
     check(len(s["records"]) == 5, "记录数应为 5")
     check(s["current_epoch"]["record_count"] == 5, "纪元计数应为 5")
+
+
+# ---------------------------------------------------------------- 重复正文场景
+
+@step("重复正文场景：跨批复制/校验/发布/重开，逐条记录完整保留")
+def scenario_duplicate_content(ctx):
+    ws_name = f"verify-dup-{uuid.uuid4().hex[:8]}"
+    _, ws = req(ctx, "POST", "/api/workspaces", {"name": ws_name}, expect=201)
+    wid = ws["id"]
+    page = req(ctx, "POST", f"/api/workspaces/{wid}/pages", expect=201)[1]["page_id"]
+
+    # 三条记录：两条正文完全相同，另一条不同；再混入大小写相近的正文
+    contents = ["降雨 10mm", "降雨 10mm", "晴天"]
+    for c in contents:
+        req(ctx, "POST", f"/api/workspaces/{wid}/records",
+            {"page_id": page, "content": c}, expect=201)
+    _, before = req(ctx, "GET", f"/api/workspaces/{wid}/state", expect=200)
+    check(len(before["records"]) == 3, "录入后应有 3 条记录")
+    orig = [(r["seq"], r["content"], r["created_at"]) for r in before["records"]]
+    check(orig[0][1] == orig[1][1], "前两条正文应完全相同")
+
+    # 迁移：每批 1 条，使相同正文出现在不同批次（跨批复制）
+    req(ctx, "POST", f"/api/workspaces/{wid}/migration/start",
+        {"page_id": page, "target_version": "v2"}, expect=200)
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{wid}/migration/copy",
+                   {"page_id": page, "batch_size": 1}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    _, s = req(ctx, "POST", f"/api/workspaces/{wid}/migration/validate",
+               {"page_id": page}, expect=200)
+    check(s["migration"]["phase"] == "publishing", "重复正文校验应通过")
+    _, s = req(ctx, "POST", f"/api/workspaces/{wid}/migration/publish",
+               {"page_id": page}, expect=200)
+    check(s["migration"]["phase"] == "published", "迁移应已发布")
+    check(s["current_epoch"]["number"] == 2 and s["current_epoch"]["version"] == "v2",
+          "应发布到新纪元 v2")
+
+    # 核对记录数量、顺序、序号、创建时间均完整
+    got = [(r["seq"], r["content"], r["created_at"]) for r in s["records"]]
+    check(len(got) == 3, f"记录数减少: {len(got)} != 3")
+    check(got == orig, f"序号/正文/时间未逐条保留: {got} != {orig}")
+    check([r["content"] for r in s["records"]] == contents, "记录顺序被打乱")
+    check(s["records"][0]["id"] != s["records"][1]["id"], "重复正文记录必须各自独立")
+
+    # 关闭后重新打开页面（模拟录入员重开）：仍是新纪元的完整三条
+    req(ctx, "POST", f"/api/workspaces/{wid}/pages/{page}/close", expect=200)
+    page2 = req(ctx, "POST", f"/api/workspaces/{wid}/pages", expect=201)[1]["page_id"]
+    _, s = req(ctx, "GET", f"/api/workspaces/{wid}/state", expect=200)
+    got = [(r["seq"], r["content"], r["created_at"]) for r in s["records"]]
+    check(got == orig, f"重开后记录不完整: {got}")
+    # 重开后可继续写入，序号顺延（不与补回的记录冲突）
+    req(ctx, "POST", f"/api/workspaces/{wid}/records",
+        {"page_id": page2, "content": "新纪元追加"}, expect=201)
+    _, s = req(ctx, "GET", f"/api/workspaces/{wid}/state", expect=200)
+    check([r["seq"] for r in s["records"]] == [1, 2, 3, 4],
+          f"追加后序号应顺延: {[r['seq'] for r in s['records']]}")
+    check(len({r['id'] for r in s['records']}) == 4, "记录 id 应全部唯一")
 
 
 # ---------------------------------------------------------------- 场景一
@@ -303,6 +362,7 @@ def main():
 
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
+             scenario_duplicate_content,
              scenario_stale_write_rejected, scenario_interruption_recovery,
              scenario_restart_consistency]
     for s in steps:

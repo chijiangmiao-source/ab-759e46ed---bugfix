@@ -62,15 +62,9 @@ CREATE TABLE IF NOT EXISTS records (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(epoch_id, seq);
-CREATE TABLE IF NOT EXISTS migration_copy_keys (
-  candidate_epoch_id TEXT NOT NULL,
-  content_key TEXT NOT NULL,
-  source_seq INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (candidate_epoch_id, content_key)
-);
-CREATE INDEX IF NOT EXISTS idx_migration_copy_keys_candidate
-  ON migration_copy_keys(candidate_epoch_id, source_seq);
+-- 旧版本曾以“归一化正文”为去重键复制记录，导致正文相同/相近的独立观测被吞掉。
+-- 逐条复制后该表不再使用：遗留库启动时直接移除，杜绝任何形式的复制期去重。
+DROP TABLE IF EXISTS migration_copy_keys;
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -156,17 +150,23 @@ class Store:
         return self.conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
 
     def _checksum(self, epoch_id: str) -> tuple[int, str]:
-        """纪元的 (记录数, 内容摘要)，用于复制后校验与发布前复核。"""
+        """纪元的 (记录数, 逐条摘要)，用于复制后校验与发布前复核。
+
+        每条记录都是独立观测：正文完全相同、大小写或空白形式相近的记录也必须
+        各自计入。因此摘要严格按 seq 逐条哈希 序号|原始正文|创建时间，不做任何
+        归一化或分组——校验、发布前复核与发布后读取面对的是同一份逐条集合。
+        """
         rows = self.conn.execute(
-            "SELECT MIN(seq) AS seq, LOWER(TRIM(content)) AS content "
-            "FROM records WHERE epoch_id=? "
-            "GROUP BY LOWER(TRIM(content)) ORDER BY seq",
+            "SELECT seq, content, created_at FROM records WHERE epoch_id=? "
+            "ORDER BY seq, created_at, id",
             (epoch_id,),
         ).fetchall()
         h = hashlib.sha256()
         for r in rows:
             h.update(f"{r['seq']}|".encode())
             h.update(r["content"].encode())
+            h.update(b"|")
+            h.update(r["created_at"].encode())
             h.update(b"\n")
         return (len(rows), h.hexdigest())
 
@@ -196,6 +196,10 @@ class Store:
                 owner = self._page(ws["migration_owner_page_id"])
                 if owner is None or owner["state"] != "active":
                     self._recover_locked(ws)
+                    ws = self._ws(ws_id)
+            # 迁移不在进行中时，安全收敛旧缺陷可能丢失的重复正文记录
+            if ws["migration_phase"] not in ACTIVE_PHASES:
+                self._heal_epoch_chain_locked(ws)
 
     def _recover_locked(self, ws: sqlite3.Row):
         """依据持久化阶段恢复：复制中->回收候选；校验中->续用同一候选；发布中->完成发布。"""
@@ -205,8 +209,6 @@ class Store:
         if phase == "copying":
             # 复制可能只完成了一部分：安全回收候选，绝不展示部分复制的数据
             if cand:
-                self.conn.execute(
-                    "DELETE FROM migration_copy_keys WHERE candidate_epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM records WHERE epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM epochs WHERE id=?", (cand,))
             self.conn.execute(
@@ -226,6 +228,54 @@ class Store:
             # 发布事务未提交即中断：候选已校验，恢复时把发布补齐（幂等）
             self._publish_locked(ws)
 
+    def _heal_epoch_chain_locked(self, ws: sqlite3.Row) -> bool:
+        """安全收敛旧缺陷：修复被“按正文去重”发布掉记录的已发布纪元链。
+
+        旧实现按归一化正文去重复制，正文相同/相近的独立观测在发布后丢失。
+        这里沿纪元号升序，把每个纪元相对上一纪元缺失的源记录原样补回
+        （沿用原 seq/正文/created_at，仅生成新 id），使多次连续迁移造成的
+        丢失也能逐级补齐。迁移后新增的记录（与任一源记录不同）原样保留并排在
+        源记录之后；seq 冲突时按 (seq, created_at, id) 排序，顺序仍正确。
+
+        只做追加，不切换指针、不回退纪元、不改迁移阶段、不复活任何旧页面，
+        因此旧页面不会重新获得写入资格。迁移进行中不动手，避免与复制交叉；
+        已完整时为空操作，可重复执行。
+        """
+        if ws["migration_phase"] in ACTIVE_PHASES:
+            return False
+        epochs = self.conn.execute(
+            "SELECT id, number FROM epochs WHERE workspace_id=? "
+            "AND kind IN ('published','superseded') ORDER BY number",
+            (ws["id"],),
+        ).fetchall()
+        changed = False
+        for prev, cur in zip(epochs, epochs[1:]):
+            prev_rows = self.conn.execute(
+                "SELECT seq, content, created_at FROM records "
+                "WHERE epoch_id=? ORDER BY seq, created_at, id",
+                (prev["id"],),
+            ).fetchall()
+            if not prev_rows:
+                continue  # 上一纪元本就无记录，没有可丢失的观测
+            present = {
+                (r["seq"], r["content"], r["created_at"])
+                for r in self.conn.execute(
+                    "SELECT seq, content, created_at FROM records WHERE epoch_id=?",
+                    (cur["id"],),
+                ).fetchall()
+            }
+            for r in prev_rows:
+                if (r["seq"], r["content"], r["created_at"]) in present:
+                    continue  # 该源记录已在（逐条复制保留了三要素）
+                self.conn.execute(
+                    "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (new_id("rec"), ws["id"], cur["id"], r["seq"], r["content"], r["created_at"]),
+                )
+                present.add((r["seq"], r["content"], r["created_at"]))
+                changed = True
+        return changed
+
     def recover_all(self):
         """进程启动时调用：上一生命周期的页面全部视为已关闭，并恢复所有迁移。"""
         with self._lock:
@@ -239,6 +289,10 @@ class Store:
                 ).fetchall()
                 for ws in rows:
                     self._recover_locked(ws)
+                # 再安全收敛所有工作区：修复旧缺陷发布掉的重复正文记录
+                healed = self.conn.execute("SELECT * FROM workspaces").fetchall()
+                for ws in healed:
+                    self._heal_epoch_chain_locked(ws)
 
     # ---------------------------------------------------------------- 工作区
 
@@ -388,8 +442,6 @@ class Store:
                 # 上一次 failed 遗留的候选先回收
                 old_cand = ws["migration_candidate_epoch_id"]
                 if old_cand:
-                    self.conn.execute(
-                        "DELETE FROM migration_copy_keys WHERE candidate_epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM records WHERE epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM epochs WHERE id=?", (old_cand,))
                 number = self.conn.execute(
@@ -445,21 +497,16 @@ class Store:
                     "WHERE epoch_id=? ORDER BY seq LIMIT ? OFFSET ?",
                     (src, batch_size, copied),
                 ).fetchall()
+                # 逐条复制：每条观测都是独立记录，正文相同也全部保留。
+                # 保留源记录的 seq/原始正文/created_at；记录 id 为全局主键而源纪元与
+                # 候选纪元同时存在，故候选另取新 id。复制进度以 OFFSET 前移，同一源
+                # 记录不会被重放，且此处不做任何按正文的忽略/去重（无 OR IGNORE）。
                 for r in rows:
-                    content_key = hashlib.sha256(
-                        r["content"].strip().casefold().encode("utf-8")
-                    ).hexdigest()
-                    claim = self.conn.execute(
-                        "INSERT OR IGNORE INTO migration_copy_keys("
-                        "candidate_epoch_id,content_key,source_seq,created_at) VALUES(?,?,?,?)",
-                        (cand, content_key, r["seq"], utcnow()),
+                    self.conn.execute(
+                        "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (new_id("rec"), ws_id, cand, r["seq"], r["content"], r["created_at"]),
                     )
-                    if claim.rowcount:
-                        self.conn.execute(
-                            "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
-                            "VALUES(?,?,?,?,?,?)",
-                            (new_id("rec"), ws_id, cand, r["seq"], r["content"], r["created_at"]),
-                        )
                 copied += len(rows)
                 total = ws["migration_total"]
                 new_phase = "validating" if copied >= total else "copying"
@@ -563,7 +610,7 @@ class Store:
             cur = self._epoch(ws["current_epoch_id"])
             records = self.conn.execute(
                 "SELECT id, seq, content, created_at FROM records "
-                "WHERE epoch_id=? ORDER BY seq",
+                "WHERE epoch_id=? ORDER BY seq, created_at, id",
                 (ws["current_epoch_id"],),
             ).fetchall()
             pages = self.conn.execute(
